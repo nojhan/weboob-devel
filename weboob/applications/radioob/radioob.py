@@ -198,14 +198,6 @@ class Radioob(ReplApplication):
 
         audio.url = _obj.url
 
-        def check_exec(executable):
-            with open(os.devnull, 'w') as devnull:
-                process = subprocess.Popen(['which', executable], stdout=devnull)
-                if process.wait() != 0:
-                    print('Please install "%s"' % executable, file=self.stderr)
-                    return False
-            return True
-
         def audio_to_file(_audio):
             ext = _audio.ext
             if not ext:
@@ -220,22 +212,97 @@ class Radioob(ReplApplication):
             dest = audio_to_file(audio)
 
         if audio.url.startswith('rtmp'):
-            if not check_exec('rtmpdump'):
+            if not self.check_exec('rtmpdump'):
                 return 1
             args = ('rtmpdump', '-e', '-r', audio.url, '-o', dest)
         elif audio.url.startswith('mms'):
-            if not check_exec('mimms'):
+            if not self.check_exec('mimms'):
                 return 1
             args = ('mimms', '-r', audio.url, dest)
         else:
-            if check_exec('wget'):
+            if self.check_exec('wget'):
                 args = ('wget', '-c', audio.url, '-O', dest)
-            elif check_exec('curl'):
+            elif self.check_exec('curl'):
                 args = ('curl', '-C', '-', audio.url, '-o', dest)
             else:
                 return 1
 
         os.spawnlp(os.P_WAIT, args[0], *args)
+
+
+    def check_exec(self, executable):
+        with open(os.devnull, 'w') as devnull:
+            process = subprocess.Popen(['which', executable], stdout=devnull)
+            if process.wait() != 0:
+                print('Please install "%s"' % executable, file=self.stderr)
+                return False
+            return True
+
+
+    def do_record(self, line):
+        """
+        record ID [STREAM]
+
+        Record each track of an audio stream in a separate file in a directory.
+        """
+        _id, stream_id = self.parse_command_args(line, 2, 1)
+        dest = stream_id
+
+        try:
+            stream_id = int(stream_id)
+        except (ValueError, TypeError):
+            stream_id = 0
+
+        obj = self.retrieve_obj(_id)
+
+        if obj is None:
+            print('No object matches with this id:', _id, file=self.stderr)
+            return 3
+
+        if isinstance(obj, Radio):
+            try:
+                streams = [obj.streams[stream_id]]
+            except IndexError:
+                print('Stream %d not found' % stream_id, file=self.stderr)
+                return 1
+        elif isinstance(obj, BaseAudio):
+            streams = [obj]
+
+        else:
+            streams = obj.tracks_list
+
+
+        if len(streams) == 0:
+            print('Radio or Audio file not found:', _id, file=self.stderr)
+            return 3
+
+        for stream in streams:
+            self.record_stream(stream, dest)
+
+
+    def record_stream(self, stream, dest = None):
+
+        if dest is None:
+            title = stream.title if stream.title else stream.id
+            dest = '%s' % re.sub('[?:/]', '-', title)
+
+        if not os.path.exists(dest):
+            os.makedirs(dest)
+
+        if not os.path.isdir(dest):
+            print('The destination "%s" is not a directory' % dest, file=self.stderr)
+            return 5
+
+        if self.check_exec('streamripper'):
+            args = ('streamripper', stream.url, '-d', dest)
+        else:
+            print('streamripper not found, please install it', file=self.stderr)
+            return 1
+
+        self.logger.debug(u'Record stream: "%s" in directory "%s"' % (stream.url, dest))
+        os.spawnlp(os.P_WAIT, args[0], *args)
+
+
 
     def complete_play(self, text, line, *ignored):
         args = line.split(' ')
