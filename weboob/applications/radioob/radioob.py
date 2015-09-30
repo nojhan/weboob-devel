@@ -19,10 +19,14 @@
 
 from __future__ import print_function
 
-import subprocess
+import subprocess # FIXME use subprocess everywhere instead of os.spawn*
 import os
+import sys
 import re
 import requests
+import signal
+import copy
+import time
 
 from weboob.capabilities.radio import CapRadio, Radio
 from weboob.capabilities.audio import CapAudio, BaseAudio, Playlist, Album
@@ -245,8 +249,72 @@ class Radioob(ReplApplication):
 
         Record each track of an audio stream in a separate file in a directory.
         """
+
+        streams, dest = self.record_parse(line)
+        if isinstance(streams, int):
+            return streams
+
+        for stream in streams:
+            self.record_stream(stream, dest, background = False)
+
+
+    def do_recordplay(self, line):
+        """
+        recordplay ID [STREAM]
+
+        Record each track of an audio stream in a separate file AND play it at the same time.
+        This takes care of not wasting bandwidth: only one connection to the stream is used.
+        """
+
+        streams,dest = self.record_parse(line)
+        if isinstance(streams, int):
+            return streams
+
+        for stream in streams:
+            # Start the recorder in the background
+            # recpid = self.record_stream(stream, dest, background=True)
+            recpid = self.record_stream(stream, dest, background=True)
+            time.sleep(1)
+            self.logger.debug(u'streamripper recorder in background with PID: %i' % recpid)
+
+            # Play the local relay server, not the original stream.
+            relay_port = self.config.get('relay_port')
+            if not relay_port:
+                relay_port = 8000
+                self.logger.debug(u'No relay_port in config file, will use default: %i' % relay_port)
+            # Build a local stream to avoid changing the stream URL.
+            # localstream = copy.deepcopy(stream) # FIXME reference kept, why?
+            # localstream.url = u'http://localhost:%i' % relay_port
+            class Media:
+                def __init__(self, url, title, _id):
+                    self.url = url
+                    self.title = title
+                    self.id = _id
+            localstream = Media(u'http://localhost:%i' % relay_port, stream.title, stream.id)
+
+            player_name = self.config.get('media_player')
+            media_player_args = self.config.get('media_player_args')
+            if not player_name:
+                self.logger.debug(u'No media_player in config file, will try to guess.')
+            try:
+                self.player.play(localstream, player_name=player_name, player_args=media_player_args)
+            except KeyboardInterrupt:
+                self.logger.debug(u'Player closed')
+                pass
+            except:
+                e = sys.exc_info()[0]
+                self.logger.debug(u'Encountered an error: %s' % e)
+                raise
+            finally:
+                # Once player ends, terminate the recorder too.
+                self.logger.debug(u'Terminate the recorder')
+                # os.kill(recpid, signal.SIGTERM)
+                os.kill(recpid, signal.SIGKILL)
+
+
+    def record_parse(self, line):
         _id, stream_id = self.parse_command_args(line, 2, 1)
-        dest = stream_id
+
 
         try:
             stream_id = int(stream_id)
@@ -276,12 +344,18 @@ class Radioob(ReplApplication):
             print('Radio or Audio file not found:', _id, file=self.stderr)
             return 3
 
-        for stream in streams:
-            self.record_stream(stream, dest)
+        dest = "records"
+        return streams, dest
 
 
-    def record_stream(self, stream, dest = None):
+    def record_stream(self, stream, dest, background = False):
+        """
+        Run streamripper on the given stream and save files in the given directory.
 
+        If background is False, this function returns the process id of the new process;
+        if background is True, returns the process’s exit code if it exits normally,
+        or -signal, where signal is the signal that killed the process.
+        """
         if dest is None:
             title = stream.title if stream.title else stream.id
             dest = '%s' % re.sub('[?:/]', '-', title)
@@ -293,14 +367,34 @@ class Radioob(ReplApplication):
             print('The destination "%s" is not a directory' % dest, file=self.stderr)
             return 5
 
-        if self.check_exec('streamripper'):
-            args = ('streamripper', stream.url, '-d', dest)
-        else:
+        if not self.check_exec('streamripper'):
             print('streamripper not found, please install it', file=self.stderr)
             return 1
 
-        self.logger.debug(u'Record stream: "%s" in directory "%s"' % (stream.url, dest))
-        os.spawnlp(os.P_WAIT, args[0], *args)
+        if background:
+            # Start a relay server, but do not try to find a free port.
+            relay_port = self.config.get('relay_port')
+            if not relay_port:
+                relay_port = 8000
+            args = ['streamripper', stream.url, '-d', dest, '-z', '-r', str(relay_port)]
+            spawn = subprocess.Popen
+        else:
+            args = ['streamripper', stream.url, '-d', dest]
+            spawn = subprocess.call
+
+        try:
+            self.logger.debug(u'Invoking: %s' % (u' '.join([str(a) for a in args])))
+            proc = spawn(args)
+        except OSError:
+            print(u'Failed to start the recorder')
+            return 7
+
+        if proc.returncode:
+            print('The recorder ended unexpectedly', file=self.stderr)
+            self.logger.debug(u'streamripper error, pid=%i, code=%i' % (proc.pid, proc.returncode))
+            return 8
+
+        return proc.pid
 
 
 
